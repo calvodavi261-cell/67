@@ -1,0 +1,171 @@
+name: PC Nuvem GPU Virtual (gratis)
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutos:
+        description: "Quantos minutos o PC fica ligado (máximo 340)"
+        required: true
+        default: "120"
+
+jobs:
+  pc:
+    runs-on: windows-latest
+    timeout-minutes: 355
+    env:
+      MINUTOS: ${{ inputs.minutos }}
+      TS: 'C:\Program Files\Tailscale\tailscale.exe'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: "Etapa 1/8 - Preparando o sistema"
+        shell: pwsh
+        run: |
+          Write-Host "Sistema: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          Write-Host "CPU: $((Get-CimInstance Win32_Processor | Select-Object -First 1).Name)"
+          Write-Host "RAM (GB): $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB))"
+          Write-Host "Etapa 1 concluida."
+
+      - name: "Etapa 2/8 - Criando a GPU virtual (renderizacao por software)"
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_VideoController | ForEach-Object { Write-Host "Placa atual: $($_.Name)" }
+
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "pc-nuvem" }
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $h
+          $asset = $rel.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
+          if (-not $asset) { throw "Nao achei o pacote do Mesa." }
+
+          Write-Host "Baixando $($asset.name)"
+          $arq = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $arq
+          & "C:\Program Files\7-Zip\7z.exe" x $arq "-oC:\Mesa" -y | Out-Null
+
+          Write-Host "Arquivos do Mesa (x64):"
+          Get-ChildItem "C:\Mesa\x64" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host " - $($_.Name)" }
+
+          [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
+          [Environment]::SetEnvironmentVariable("LIBGL_ALWAYS_SOFTWARE", "1", "Machine")
+          [Environment]::SetEnvironmentVariable("MESA_GL_VERSION_OVERRIDE", "4.5", "Machine")
+
+          Set-Content -Path "C:\Mesa\ativar-no-app.ps1" -Value @(
+            'param([Parameter(Mandatory=$true)][string]$Pasta)',
+            'foreach ($d in "opengl32.dll","libgallium_wgl.dll","libglapi.dll") { Copy-Item "C:\Mesa\x64\$d" $Pasta -Force }',
+            'Write-Host "Mesa copiado para $Pasta"'
+          )
+          Write-Host "Etapa 2 concluida."
+          exit 0
+
+      - name: "Etapa 3/8 - Instalando o Tailscale"
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+          & $env:TS version
+          Write-Host "Etapa 3 concluida."
+          exit 0
+
+      - name: "Etapa 4/8 - LINK DE LOGIN DO TAILSCALE (clique, entre na sua conta e volte)"
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "ts-login.out"
+          $err = Join-Path $env:RUNNER_TEMP "ts-login.err"
+          Start-Process -FilePath $env:TS -ArgumentList "up","--unattended","--hostname=pc-nuvem-gpu","--accept-dns=false" -RedirectStandardOutput $log -RedirectStandardError $err -WindowStyle Hidden
+
+          $url = $null
+          for ($i = 0; $i -lt 60 -and -not $url; $i++) {
+            Start-Sleep -Seconds 2
+            $txt = ""
+            foreach ($f in @($log, $err)) {
+              if (Test-Path $f) { $txt += (Get-Content $f -Raw) }
+            }
+            if ($txt -match 'https://login\.tailscale\.com/\S+') { $url = $Matches[0] }
+          }
+          if (-not $url) { throw "Nao consegui gerar o link de login do Tailscale." }
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " LOGIN DO TAILSCALE - clique no link abaixo:"
+          Write-Host " $url"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "::notice title=LOGIN DO TAILSCALE::Clique, entre na sua conta e volte aqui: $url"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Login do Tailscale`n[Clique aqui para entrar na sua conta]($url)`n`nDepois de logar, volte e aguarde a Etapa 5."
+          exit 0
+
+      - name: "Etapa 5/8 - Aguardando voce logar no Tailscale (ate 10 min)"
+        shell: pwsh
+        run: |
+          $ip = $null
+          for ($i = 0; $i -lt 120 -and -not $ip; $i++) {
+            Start-Sleep -Seconds 5
+            $saida = & $env:TS ip -4 2>$null | Select-Object -First 1
+            if ("$saida" -match '^100\.') { $ip = "$saida".Trim() }
+            if (-not $ip -and ($i % 6 -eq 5)) { Write-Host "Ainda aguardando o login..." }
+          }
+          if (-not $ip) { throw "Login nao concluido a tempo. Rode o workflow de novo." }
+          Add-Content -Path $env:GITHUB_ENV -Value "TS_IP=$ip"
+          Write-Host "Logado! IP do PC no Tailscale: $ip"
+          exit 0
+
+      - name: "Etapa 6/8 - Criando usuario e liberando a Area de Trabalho Remota"
+        shell: pwsh
+        run: |
+          $usuario = "pcnuvem"
+          $chars = (48..57) + (65..90) + (97..122)
+          $senha = (-join ($chars | Get-Random -Count 14 | ForEach-Object { [char]$_ })) + "Aa1#"
+          $sec = ConvertTo-SecureString $senha -AsPlainText -Force
+
+          if (Get-LocalUser -Name $usuario -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $usuario -Password $sec
+          } else {
+            New-LocalUser -Name $usuario -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $usuario -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usuario -ErrorAction SilentlyContinue
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+          New-NetFirewallRule -DisplayName "RDP Tailscale" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any | Out-Null
+
+          Add-Content -Path $env:GITHUB_ENV -Value "PC_USER=$usuario"
+          Add-Content -Path $env:GITHUB_ENV -Value "PC_PASS=$senha"
+          Write-Host "Etapa 6 concluida."
+          exit 0
+
+      - name: "Etapa 7/8 - DADOS DO PC (IP, usuario e senha)"
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " DADOS PARA CONECTAR (app Windows App / RDP)"
+          Write-Host " IP:      $env:TS_IP"
+          Write-Host " Usuario: $env:PC_USER"
+          Write-Host " Senha:   $env:PC_PASS"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "::notice title=DADOS DO PC::IP: $env:TS_IP | Usuario: $env:PC_USER | Senha: $env:PC_PASS"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Dados do PC`n- **IP:** ``$env:TS_IP```n- **Usuario:** ``$env:PC_USER```n- **Senha:** ``$env:PC_PASS```n`nConecte pelo app Windows App com o Tailscale ligado na mesma conta."
+          exit 0
+
+      - name: "Etapa 8/8 - PC ligado (mantendo ativo)"
+        shell: pwsh
+        run: |
+          $min = [math]::Min([int]$env:MINUTOS, 340)
+          $fim = (Get-Date).AddMinutes($min)
+          while ((Get-Date) -lt $fim) {
+            $resta = [math]::Ceiling(($fim - (Get-Date)).TotalMinutes)
+            Write-Host "PC ligado | restam $resta min | IP $env:TS_IP | usuario $env:PC_USER"
+            Start-Sleep -Seconds 60
+          }
+          Write-Host "Tempo esgotado. Encerrando."
+          exit 0
+
+      - name: "Finalizando - saindo do Tailscale"
+        if: always()
+        shell: pwsh
+        run: |
+          & $env:TS logout 2>$null
+          exit 0
